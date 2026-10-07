@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AR Stickers (sem marcador)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; touch-action: none; }
+  #wrap { position: absolute; left: 50%; top: 50%; transform-origin: 0 0; }
+  video, svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #stickers { position: absolute; left: 0; top: 0; transition: opacity .2s; }
+  .s { position: absolute; left: 0; top: 0; width: 100px; height: 100px; transform-origin: 0 0; }
+  .s img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+  #hud { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 10px; align-items: center; justify-content: center;
+         padding: 12px; padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); color: #fff;
+         background: rgba(0,0,0,.5); z-index: 5; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 0; }
+</style>
+</head>
+<body>
+<div id="stage"><div id="wrap">
+  <video id="v" playsinline muted autoplay></video>
+  <svg id="svg"><polygon id="poly" fill="rgba(0,255,120,.12)" stroke="#0f8" stroke-width="3"/></svg>
+  <div id="stickers"></div>
+</div></div>
+<div id="hud"><span id="info">A carregar OpenCV…</span>
+  <button id="outline">Contorno</button><button id="reset">Recomeçar</button></div>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js" onload="opencvLoaded()"></script>
+<script>
+// ---- Configuração ----
+const LW = 35.5, LH = 26.5;            // portátil em cm (largura x profundidade)
+const STICKER_CM = 4.5;                // tamanho do sticker
+// Imagens numeradas 1..10 na pasta "stickers" (stickers/1.png ... stickers/10.png). Muda a extensão se for preciso.
+const EXT = 'png';
+const FILES = Array.from({ length: 10 }, (_, i) => `stickers/${i + 1}.${EXT}`);
+FILES.forEach(f => { new Image().src = f; });   // pré-carrega
+const PW = 320;                        // largura de processamento (menor = mais rápido)
+
+const $ = id => document.getElementById(id);
+const video = $('v'), wrap = $('wrap'), info = $('info'), poly = $('poly'), stickersEl = $('stickers');
+let vw, vh, PH, K, ctx, running = false, showOutline = true;
+let src, gray, bin, kernel, ksz, contours, hier;
+let prev = null, lost = 99, Hm = null, Hinv = null;
+const stickers = [];
+
+// ---- Matemática 3x3 (row-major) ----
+const mul3 = (a, b) => { const r = []; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+  r.push(a[i*3]*b[j] + a[i*3+1]*b[3+j] + a[i*3+2]*b[6+j]); return r; };
+function inv3(m) {
+  const [a,b,c,d,e,f,g,h,i] = m, A = e*i-f*h, B = -(d*i-f*g), C = d*h-e*g, det = a*A + b*B + c*C;
+  return [A, -(b*i-c*h), b*f-c*e, B, a*i-c*g, -(a*f-c*d), C, -(a*h-b*g), a*e-b*d].map(x => x / det);
+}
+const applyH = (M, x, y) => { const w = M[6]*x + M[7]*y + M[8];
+  return [(M[0]*x + M[1]*y + M[2]) / w, (M[3]*x + M[4]*y + M[5]) / w]; };
+const dist = (a, b) => Math.hypot(a[0]-b[0], a[1]-b[1]);
+const rot = (arr, r) => arr.slice(r).concat(arr.slice(0, r));
+
+// ---- Arranque ----
+function opencvLoaded() {
+  const go = () => { info.textContent = 'A abrir a câmara…'; startCamera(); };
+  if (window.cv instanceof Promise) cv.then(m => { window.cv = m; go(); });
+  else if (cv.Mat) go();
+  else cv.onRuntimeInitialized = go;
+}
+async function startCamera() {
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    await video.play();
+  } catch (e) { info.textContent = 'Sem acesso à câmara (precisa de HTTPS e permissão).'; return; }
+  await new Promise(r => video.videoWidth ? r() : video.addEventListener('loadedmetadata', r, { once: true }));
+  vw = video.videoWidth; vh = video.videoHeight; PH = Math.round(PW * vh / vw); K = vw / PW;
+  wrap.style.width = vw + 'px'; wrap.style.height = vh + 'px';
+  $('svg').setAttribute('viewBox', `0 0 ${vw} ${vh}`);
+  stickersEl.style.width = vw + 'px'; stickersEl.style.height = vh + 'px';
+  const cv2 = document.createElement('canvas'); cv2.width = PW; cv2.height = PH;
+  ctx = cv2.getContext('2d', { willReadFrequently: true });
+  src = new cv.Mat(PH, PW, cv.CV_8UC4); gray = new cv.Mat(); bin = new cv.Mat();
+  kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9)); ksz = new cv.Size(5, 5);
+  contours = new cv.MatVector(); hier = new cv.Mat();
+  fit(); addEventListener('resize', fit);
+  running = true; loop();
+}
+function fit() {
+  const s = Math.min(innerWidth / vw, innerHeight / vh);
+  wrap.style.transform = `scale(${s}) translate(${-vw / 2}px, ${-vh / 2}px)`;
+}
+
+// ---- Deteção do portátil (escuro) sobre a mesa (castanha) ----
+function detect() {
+  ctx.drawImage(video, 0, 0, PW, PH);
+  src.data.set(ctx.getImageData(0, 0, PW, PH).data);
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, gray, ksz, 0);
+  cv.threshold(gray, bin, 0, 255, cv.THRESH_BINARY_INV | cv.THRESH_OTSU);  // escuro = branco
+  cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel);                       // tapa reflexos/buracos
+  cv.findContours(bin, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  let best = -1, bestA = 0;
+  for (let i = 0; i < contours.size(); i++) {
+    const c = contours.get(i), a = cv.contourArea(c); c.delete();
+    if (a > bestA) { bestA = a; best = i; }
+  }
+  const frac = bestA / (PW * PH);
+  if (best < 0 || frac < 0.05 || frac > 0.9) return null;
+
+  const c = contours.get(best), hull = new cv.Mat();
+  cv.convexHull(c, hull, false, true);
+  const per = cv.arcLength(hull, true);
+  let pts = null;
+  for (const e of [0.02, 0.035, 0.05, 0.07]) {
+    const ap = new cv.Mat(); cv.approxPolyDP(hull, ap, e * per, true);
+    if (ap.rows === 4) { pts = Array.from(ap.data32S); ap.delete(); break; }
+    ap.delete();
+  }
+  c.delete(); hull.delete();
+  if (!pts) return null;
+
+  let q = [0, 2, 4, 6].map(i => [pts[i] * K, pts[i + 1] * K]);
+  const area = q.reduce((s, p, i) => { const n = q[(i + 1) % 4]; return s + p[0]*n[1] - n[0]*p[1]; }, 0);
+  if (area < 0) q.reverse();                                  // sentido horário (TL, TR, BR, BL)
+
+  const hLen = dist(q[0], q[1]) + dist(q[3], q[2]), vLen = dist(q[0], q[3]) + dist(q[1], q[2]);
+  const ratio = Math.max(hLen, vLen) / Math.min(hLen, vLen);
+  if (ratio < 1.0 || ratio > 2.4) return null;                // forma implausível
+
+  if (prev && lost < 20) {                                    // continuidade: mantém a mesma orientação
+    let bestR = 0, bestD = Infinity;
+    for (let r = 0; r < 4; r++) { const t = rot(q, r); const d = t.reduce((s, p, i) => s + dist(p, prev[i]), 0);
+      if (d < bestD) { bestD = d; bestR = r; } }
+    q = rot(q, bestR);
+    q = q.map((p, i) => [prev[i][0] + 0.5 * (p[0] - prev[i][0]), prev[i][1] + 0.5 * (p[1] - prev[i][1])]);
+  } else {                                                    // 1.ª vez: começa no canto mais "alto-esquerdo"
+    let k = 0; q.forEach((p, i) => { if (p[0] + p[1] < q[k][0] + q[k][1]) k = i; });
+    q = rot(q, k);
+    const longIsH = dist(q[0], q[1]) + dist(q[3], q[2]) > dist(q[0], q[3]) + dist(q[1], q[2]);
+    if (longIsH !== (LW > LH)) q = rot(q, 1);                 // lado maior = largura do portátil
+  }
+  return q;
+}
+
+function updateH(q) {
+  const s = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, LW, 0, LW, LH, 0, LH]);
+  const d = cv.matFromArray(4, 1, cv.CV_32FC2, q.flat());
+  const m = cv.getPerspectiveTransform(s, d);
+  Hm = Array.from(m.data64F); Hinv = inv3(Hm);
+  s.delete(); d.delete(); m.delete();
+}
+
+function place(st) {   // matrix3d: sticker (px locais) -> cm do portátil -> imagem
+  const S = 100, s = STICKER_CM / S, h = STICKER_CM / 2, c = Math.cos(st.rot), n = Math.sin(st.rot);
+  const A = [c*s, -n*s, st.x - c*h + n*h,  n*s, c*s, st.y - n*h - c*h,  0, 0, 1];
+  const M = mul3(Hm, A), w = M[8];
+  st.el.style.transform = `matrix3d(${M[0]/w},${M[3]/w},0,${M[6]/w},${M[1]/w},${M[4]/w},0,${M[7]/w},0,0,1,0,${M[2]/w},${M[5]/w},0,1)`;
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  const q = detect();
+  if (q) { prev = q; lost = 0; updateH(q); } else lost++;
+  const ok = prev && lost < 10;
+  stickersEl.style.opacity = ok ? 1 : 0;
+  poly.style.display = ok && showOutline ? '' : 'none';
+  if (ok) {
+    poly.setAttribute('points', prev.map(p => p.join(',')).join(' '));
+    stickers.forEach(place);
+    info.textContent = `Stickers: ${stickers.length}/${FILES.length} — toca no portátil`;
+  } else info.textContent = 'A procurar o portátil… (boa luz, vê-lo inteiro)';
+}
+
+// ---- Toque -> coordenadas do portátil ----
+$('stage').addEventListener('pointerdown', e => {
+  if (!running || !prev || lost >= 10 || stickers.length >= FILES.length) return;
+  const r = wrap.getBoundingClientRect();
+  const [X, Y] = applyH(Hinv, (e.clientX - r.left) * vw / r.width, (e.clientY - r.top) * vh / r.height);
+  if (X < 0 || X > LW || Y < 0 || Y > LH) return;            // fora dos limites do portátil
+  const el = document.createElement('div'); el.className = 's'; el.innerHTML = `<img src="${FILES[stickers.length]}" alt="">`;
+  stickersEl.appendChild(el);
+  stickers.push({ el, x: X, y: Y, rot: (Math.random() - 0.5) * 0.6 });
+});
+$('reset').onclick = () => { stickers.forEach(s => s.el.remove()); stickers.length = 0; };
+$('outline').onclick = () => showOutline = !showOutline;
+</script>
+</body>
+</html>
