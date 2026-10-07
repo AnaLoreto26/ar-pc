@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>AR Stickers (sem marcador)</title>
+<title>AR Stickers (toque com o dedo)</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
   #stage { position: fixed; inset: 0; touch-action: none; }
@@ -21,7 +21,9 @@
 <body>
 <div id="stage"><div id="wrap">
   <video id="v" playsinline muted autoplay></video>
-  <svg id="svg"><polygon id="poly" fill="rgba(0,255,120,.12)" stroke="#0f8" stroke-width="3"/></svg>
+  <svg id="svg"><polygon id="poly" fill="rgba(0,255,120,.12)" stroke="#0f8" stroke-width="3"/>
+    <circle id="ring" r="30" fill="none" stroke="#0f8" stroke-width="7" stroke-linecap="round" style="display:none"/>
+    <circle id="dot" r="8" fill="#ff0" style="display:none"/></svg>
   <div id="stickers"></div>
 </div></div>
 <div id="hud"><span id="info">A carregar OpenCV…</span>
@@ -37,12 +39,17 @@ const EXT = 'png';
 const FILES = Array.from({ length: 10 }, (_, i) => `stickers/${i + 1}.${EXT}`);
 FILES.forEach(f => { new Image().src = f; });   // pré-carrega
 const PW = 320;                        // largura de processamento (menor = mais rápido)
+const DWELL_MS = 500;                  // tempo com o dedo parado para "colar"
+const HOLD_CM = 1.5;                   // quanto o dedo pode mexer e ainda contar como parado
+const REARM_CM = 4;                    // distância a afastar o dedo antes de poder colar outro
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
 const $ = id => document.getElementById(id);
 const video = $('v'), wrap = $('wrap'), info = $('info'), poly = $('poly'), stickersEl = $('stickers');
 let vw, vh, PH, K, ctx, running = false, showOutline = true;
 let src, gray, bin, kernel, ksz, contours, hier;
-let prev = null, lost = 99, Hm = null, Hinv = null;
+let prev = null, lost = 99, Hm = null, Hinv = null, hands = null;
 const stickers = [];
 
 // ---- Matemática 3x3 (row-major) ----
@@ -81,6 +88,14 @@ async function startCamera() {
   kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9)); ksz = new cv.Size(5, 5);
   contours = new cv.MatVector(); hier = new cv.Mat();
   fit(); addEventListener('resize', fit);
+  info.textContent = 'A carregar deteção de mãos…';
+  try {
+    const { HandLandmarker, FilesetResolver } = await import(MP + '/vision_bundle.mjs');
+    const fileset = await FilesetResolver.forVisionTasks(MP + '/wasm');
+    const opts = d => ({ baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: 'VIDEO', numHands: 1 });
+    try { hands = await HandLandmarker.createFromOptions(fileset, opts('GPU')); }
+    catch (e) { hands = await HandLandmarker.createFromOptions(fileset, opts('CPU')); }
+  } catch (e) { info.textContent = 'Falhou a carregar o MediaPipe (rede?).'; return; }
   running = true; loop();
 }
 function fit() {
@@ -156,30 +171,66 @@ function place(st) {   // matrix3d: sticker (px locais) -> cm do portátil -> im
   st.el.style.transform = `matrix3d(${M[0]/w},${M[3]/w},0,${M[6]/w},${M[1]/w},${M[4]/w},0,${M[7]/w},0,0,1,0,${M[2]/w},${M[5]/w},0,1)`;
 }
 
+// ---- Adicionar sticker ----
+function addSticker(x, y) {
+  const el = document.createElement('div'); el.className = 's';
+  el.innerHTML = `<img src="${FILES[stickers.length]}" alt="">`;
+  stickersEl.appendChild(el);
+  stickers.push({ el, x, y, rot: (Math.random() - 0.5) * 0.6 });
+}
+
+// ---- Lógica do "toque": dedo parado dentro do portátil ----
+const ring = $('ring'), dot = $('dot'), CIRC = 2 * Math.PI * 30;
+let anchorPt = null, since = 0, armed = true, lastPlaced = null, lastSeen = 0;
+let tipPx = null, frame = 0, lastT = -1;
+
+function fingerLogic(tip, px) {
+  const now = performance.now();
+  dot.style.display = px ? '' : 'none';
+  if (px) { dot.setAttribute('cx', px[0]); dot.setAttribute('cy', px[1]); lastSeen = now; }
+  const inside = tip && tip[0] >= 0 && tip[0] <= LW && tip[1] >= 0 && tip[1] <= LH;
+  let progress = null;
+  if (!px) { anchorPt = null; if (now - lastSeen > 600) armed = true; }
+  else if (!inside) { anchorPt = null; armed = true; }
+  else if (!armed) { if (dist(tip, lastPlaced) > REARM_CM) armed = true; }
+  else if (stickers.length < FILES.length) {
+    if (!anchorPt || dist(tip, anchorPt) > HOLD_CM) { anchorPt = tip; since = now; }
+    progress = Math.min(1, (now - since) / DWELL_MS);
+    if (progress >= 1) { addSticker(anchorPt[0], anchorPt[1]); lastPlaced = anchorPt; armed = false; anchorPt = null; progress = null; }
+  }
+  if (progress === null) ring.style.display = 'none';
+  else {
+    ring.style.display = '';
+    ring.setAttribute('cx', px[0]); ring.setAttribute('cy', px[1]);
+    ring.setAttribute('transform', `rotate(-90 ${px[0]} ${px[1]})`);
+    ring.setAttribute('stroke-dasharray', `${progress * CIRC} ${CIRC}`);
+  }
+}
+
 function loop() {
   requestAnimationFrame(loop);
-  const q = detect();
-  if (q) { prev = q; lost = 0; updateH(q); } else lost++;
+  if (frame++ % 2 === 0) {                                    // portátil: de 2 em 2 frames (poupa CPU)
+    const q = detect();
+    if (q) { prev = q; lost = 0; updateH(q); } else lost++;
+  }
   const ok = prev && lost < 10;
   stickersEl.style.opacity = ok ? 1 : 0;
   poly.style.display = ok && showOutline ? '' : 'none';
-  if (ok) {
-    poly.setAttribute('points', prev.map(p => p.join(',')).join(' '));
-    stickers.forEach(place);
-    info.textContent = `Stickers: ${stickers.length}/${FILES.length} — toca no portátil`;
-  } else info.textContent = 'A procurar o portátil… (boa luz, vê-lo inteiro)';
+  if (ok) { poly.setAttribute('points', prev.map(p => p.join(',')).join(' ')); stickers.forEach(place); }
+
+  if (video.currentTime !== lastT) {                          // mão: a cada frame novo de vídeo
+    lastT = video.currentTime;
+    const lm = hands.detectForVideo(video, performance.now()).landmarks[0];
+    tipPx = lm ? [lm[8].x * vw, lm[8].y * vh] : null;         // ponta do indicador
+  }
+  const tipCm = ok && tipPx ? applyH(Hinv, tipPx[0], tipPx[1]) : null;
+  fingerLogic(tipCm, ok ? tipPx : null);
+
+  info.textContent = !ok ? 'A procurar o portátil… (boa luz, vê-lo inteiro)'
+    : stickers.length >= FILES.length ? 'Todos colados! Carrega em Recomeçar.'
+    : `Stickers: ${stickers.length}/${FILES.length} — pousa o indicador no portátil e fica parado`;
 }
 
-// ---- Toque -> coordenadas do portátil ----
-$('stage').addEventListener('pointerdown', e => {
-  if (!running || !prev || lost >= 10 || stickers.length >= FILES.length) return;
-  const r = wrap.getBoundingClientRect();
-  const [X, Y] = applyH(Hinv, (e.clientX - r.left) * vw / r.width, (e.clientY - r.top) * vh / r.height);
-  if (X < 0 || X > LW || Y < 0 || Y > LH) return;            // fora dos limites do portátil
-  const el = document.createElement('div'); el.className = 's'; el.innerHTML = `<img src="${FILES[stickers.length]}" alt="">`;
-  stickersEl.appendChild(el);
-  stickers.push({ el, x: X, y: Y, rot: (Math.random() - 0.5) * 0.6 });
-});
 $('reset').onclick = () => { stickers.forEach(s => s.el.remove()); stickers.length = 0; };
 $('outline').onclick = () => showOutline = !showOutline;
 </script>
